@@ -10,6 +10,10 @@
 #   FILES_DIR        플래싱 파일 위치     (기본값: <스크립트>/resources)
 #   WORK_DIR         작업(추출) 디렉터리  (기본값: <스크립트>/l4t-work)
 #   BOARD_CONFIG     CTI 보드 설정        (기본값: cti/orin-nx/hadron/base)
+#   CTI_VERSION      CTI BSP 버전         (기본값: 005)
+#   BSP_URL          NVIDIA BSP 다운로드 URL
+#   ROOTFS_URL       NVIDIA RootFS 다운로드 URL
+#   CTI_URL          CTI BSP 다운로드 URL
 #   DEFAULT_USER     기본 사용자 이름     (기본값: nvidia)
 #   DEFAULT_PASS     기본 사용자 비밀번호 (기본값: nvidia)
 #   DEFAULT_HOST     기본 호스트 이름     (기본값: orinnx)
@@ -32,6 +36,7 @@
 #   START_STEP=7 ./flash-host.sh       # 플래싱만 재실행
 #   ONLY_STEP=4 ./flash-host.sh        # CTI BSP 적용 step만 실행
 #   BOOTLOADER_ONLY=1 ./flash-host.sh   # QSPI 부트로더만
+#   ./flash-host.sh --download-only     # 리소스 다운로드만 수행
 #   ./flash-host.sh --all              # 처음부터 끝까지
 #   ./flash-host.sh --start 1          # 처음부터 끝까지
 #   ./flash-host.sh --start 5
@@ -62,6 +67,7 @@ Options:
   --prepare-only          플래싱 전 단계(1~6)만 실행
   --flashing-only         이미지 플래싱만 실행 (7단계)
   --bootloader-only       QSPI 부트로더만 즉시 플래싱 (step 1~6 건너뜀)
+  --download-only         리소스 다운로드만 수행 후 종료
   --help                  도움말 출력
 
 Environment variables are also supported and used as defaults.
@@ -72,6 +78,13 @@ EOF
 FILES_DIR="${FILES_DIR:-$SCRIPT_DIR/resources}"
 WORK_DIR="${WORK_DIR:-$SCRIPT_DIR/l4t-work}"
 BOARD_CONFIG="${BOARD_CONFIG:-cti/orin-nx/hadron/base}"
+CTI_VERSION="${CTI_VERSION:-005}"
+BSP_FILE_NAME="Jetson_Linux_R36.4.4_aarch64.tbz2"
+ROOTFS_FILE_NAME="Tegra_Linux_Sample-Root-Filesystem_R36.4.4_aarch64.tbz2"
+CTI_FILE_NAME="CTI-L4T-ORIN-NX-NANO-36.4.4-V${CTI_VERSION}.tgz"
+BSP_URL="${BSP_URL:-https://developer.nvidia.com/downloads/embedded/l4t/r36_release_v4.4/release/Jetson_Linux_R36.4.4_aarch64.tbz2}"
+ROOTFS_URL="${ROOTFS_URL:-https://developer.nvidia.com/downloads/embedded/l4t/r36_release_v4.4/release/Tegra_Linux_Sample-Root-Filesystem_R36.4.4_aarch64.tbz2}"
+CTI_URL="${CTI_URL:-https://connecttech.com/ftp/Drivers/$CTI_FILE_NAME}"
 DEFAULT_USER="${DEFAULT_USER:-nvidia}"
 DEFAULT_PASS="${DEFAULT_PASS:-nvidia}"
 DEFAULT_HOST="${DEFAULT_HOST:-orinnx}"
@@ -79,6 +92,7 @@ START_STEP="${START_STEP:-1}"
 END_STEP="${END_STEP:-7}"
 ONLY_STEP="${ONLY_STEP:-}"
 BOOTLOADER_ONLY="${BOOTLOADER_ONLY:-0}"
+DOWNLOAD_ONLY="${DOWNLOAD_ONLY:-0}"
 INIT_SCRIPT_NAME="initialize.sh"
 
 parse_args() {
@@ -187,6 +201,11 @@ parse_args() {
                 BOOTLOADER_ONLY=1
                 shift
                 ;;
+            --download-only)
+                DOWNLOAD_ONLY=1
+                BOOTLOADER_ONLY=0
+                shift
+                ;;
             --help|-h)
                 usage
                 exit 0
@@ -212,7 +231,9 @@ parse_args "$@"
 # Ubuntu 22.04: sudoers "Defaults use_pty"로 인해 PTY 없는 환경에서 sudo가 전부 실패.
 # 가장 확실한 해결책은 처음부터 root로 실행하는 것.
 # root면 SUDO 변수를 비워서 sudo 없이 직접 실행, 일반 유저면 sudo 사용.
-if [ "$(id -u)" -eq 0 ]; then
+if [ "$DOWNLOAD_ONLY" = "1" ]; then
+    SUDO=""
+elif [ "$(id -u)" -eq 0 ]; then
     SUDO=""
 else
     # sudo가 동작하는지 확인
@@ -232,7 +253,7 @@ fi
 HOST_OS_ID=$(grep '^ID=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')
 HOST_OS_VER=$(grep '^VERSION_ID=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')
 
-if [ "$HOST_OS_ID" != "ubuntu" ] || { [ "$HOST_OS_VER" != "22.04" ] && [ "$HOST_OS_VER" != "24.04" ]; }; then
+if [ "$DOWNLOAD_ONLY" = "0" ] && { [ "$HOST_OS_ID" != "ubuntu" ] || { [ "$HOST_OS_VER" != "22.04" ] && [ "$HOST_OS_VER" != "24.04" ]; }; }; then
     echo "[WARN] 미검증 호스트 OS: $HOST_OS_ID $HOST_OS_VER (Ubuntu 22.04 / 24.04 권장)"
     echo "       계속하려면 Enter, 중단하려면 Ctrl+C"
     read -r
@@ -264,6 +285,53 @@ validate_bool_flag() {
     esac
 }
 
+download_file_if_missing() {
+    local target_path="$1"
+    local download_url="$2"
+    local label="$3"
+    local tmp_path="${target_path}.part"
+
+    if [ -f "$target_path" ]; then
+        echo "[SKIP] ${label} 이미 존재: $(basename "$target_path")"
+        return 0
+    fi
+
+    if [ -z "$download_url" ]; then
+        echo "[ERROR] ${label} 다운로드 URL이 비어 있습니다."
+        echo "        환경변수 설정 후 재실행하세요: export CTI_URL='<다운로드 URL>'"
+        exit 1
+    fi
+
+    echo "[INFO] ${label} 다운로드 중..."
+    echo "       URL: $download_url"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fL --retry 3 --retry-delay 3 -o "$tmp_path" "$download_url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -O "$tmp_path" "$download_url"
+    else
+        echo "[ERROR] curl 또는 wget이 필요합니다."
+        exit 1
+    fi
+
+    mv "$tmp_path" "$target_path"
+    echo "[OK] 다운로드 완료: $(basename "$target_path")"
+}
+
+prepare_resource_archives() {
+    mkdir -p "$FILES_DIR"
+
+    BSP_FILE="$FILES_DIR/$BSP_FILE_NAME"
+    ROOTFS_FILE="$FILES_DIR/$ROOTFS_FILE_NAME"
+    CTI_FILE="$FILES_DIR/$CTI_FILE_NAME"
+
+    echo "=== 리소스 준비(다운로드) ==="
+    download_file_if_missing "$BSP_FILE" "$BSP_URL" "NVIDIA BSP"
+    download_file_if_missing "$ROOTFS_FILE" "$ROOTFS_URL" "NVIDIA RootFS"
+    download_file_if_missing "$CTI_FILE" "$CTI_URL" "CTI BSP"
+    echo ""
+}
+
 # ONLY_STEP이 지정되면 해당 step만, 아니면 START_STEP부터 끝까지 실행
 run_step() {
     local step="$1"
@@ -289,6 +357,7 @@ if [ -n "$ONLY_STEP" ]; then
     validate_step_number "$ONLY_STEP"
 fi
 validate_bool_flag "$BOOTLOADER_ONLY"
+validate_bool_flag "$DOWNLOAD_ONLY"
 if [ "$START_STEP" -gt "$END_STEP" ]; then
     echo "[ERROR] START_STEP이 END_STEP보다 클 수 없습니다: $START_STEP > $END_STEP"
     exit 1
@@ -296,6 +365,20 @@ fi
 if [ "$BOOTLOADER_ONLY" = "1" ] && [ -n "$ONLY_STEP" ]; then
     echo "[ERROR] --bootloader-only(또는 BOOTLOADER_ONLY=1)와 --only는 함께 사용할 수 없습니다."
     exit 1
+fi
+if [ "$DOWNLOAD_ONLY" = "1" ] && [ "$BOOTLOADER_ONLY" = "1" ]; then
+    echo "[ERROR] --download-only와 --bootloader-only는 함께 사용할 수 없습니다."
+    exit 1
+fi
+
+if [ "$DOWNLOAD_ONLY" = "1" ]; then
+    echo "=== 리소스 다운로드 전용 모드 ==="
+    echo "  FILES_DIR      : $FILES_DIR"
+    echo "  CTI_VERSION    : $CTI_VERSION"
+    echo ""
+    prepare_resource_archives
+    echo "=== 다운로드 완료 ==="
+    exit 0
 fi
 
 cleanup_chroot_mounts() {
@@ -384,14 +467,12 @@ fi
 
 # ── 파일 확인 (단계 2 이상에서 필요) ─────────────────────────────────────────
 if requires_resource_archives; then
-    BSP_FILE=$(ls "$FILES_DIR"/Jetson_Linux_R36.*.tbz2 2>/dev/null | head -1 || true)
-    ROOTFS_FILE=$(ls "$FILES_DIR"/Tegra_Linux_Sample-Root-Filesystem_R36.*.tbz2 2>/dev/null | head -1 || true)
-    CTI_FILE=$(ls "$FILES_DIR"/CTI-L4T-ORIN-NX-NANO-*.tgz 2>/dev/null | head -1 || true)
+    prepare_resource_archives
 
     for var_name in BSP_FILE ROOTFS_FILE CTI_FILE; do
         val="${!var_name}"
-        if [ -z "$val" ]; then
-            echo "[ERROR] $var_name 파일을 찾을 수 없습니다: $FILES_DIR"
+        if [ ! -f "$val" ]; then
+            echo "[ERROR] $var_name 파일을 찾을 수 없습니다: $val"
             exit 1
         fi
         echo "[OK] $(basename "$val")"
